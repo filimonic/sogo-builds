@@ -1,0 +1,181 @@
+name: Build latest SOGo
+run-name: Check latest SOGo release and build .deb packages
+permissions:
+  contents: write
+on:
+  schedule:
+    # Every day at 15:30 UTC
+    # - cron: 30  15  *  *  *
+  workflow_dispatch:
+
+env:
+  SOGO_REPO_NAME: ${{ vars.SOGO_REPO }}
+  SOPE_REPO_NAME: ${{ vars.SOPE_REPO }}
+  TARGET_REPO_NAME: ${{ github.repository }}
+
+jobs:
+  check_build_need:
+    name: "❔Check if new build needed"
+    runs-on: ubuntu-20.04
+    steps:
+      - name: 🌐 Get latest SOGo (${{ env.SOGO_REPO_NAME }}) release tag
+        run: |
+          echo "sogo_release_tag=$(curl -s https://api.github.com/repos/$SOGO_REPO_NAME/releases/latest | jq '.tag_name' | sed 's/\"//g' )" >> "$GITHUB_ENV"
+      - name: 💥 Fail on empty sogo_release_tag
+        if: ${{ env.sogo_release_tag == '' || env.sogo_release_tag == null }}
+        run: |
+          echo "::error ::sogo_release_tag is EMPTY"
+          exit 1
+      - name: 🌐 Get SOGo release version
+        run: |
+          echo "sogo_release_version=$( echo $sogo_release_tag | awk -F '-' '{ print $2 }' )" >> "$GITHUB_ENV"
+      - name: 💥 Fail on empty sogo_release_version
+        if: ${{ env.sogo_release_version == '' || env.sogo_release_version == null }}
+        run: |
+          echo "::error ::sogo_release_version is EMPTY"
+          exit 1
+      - name: 🌐 Get latest target(${{ env.TARGET_REPO_NAME }}) release tag
+        run: |
+          echo "target_release_tag=$(curl -s https://api.github.com/repos/$TARGET_REPO_NAME/releases/latest | jq '.tag_name' | sed 's/\"//g')" >> "$GITHUB_ENV"
+      - name: ⚖️Compare source and target release tags
+        run: |
+          echo "need_build=${{ ((env.target_release_tag == '')  || (env.target_release_tag == 'null') || (env.target_release_tag != env.sogo_release_tag)) && 'TRUE' || 'FALSE' }}" >> "$GITHUB_ENV"
+      - name: ⬆️Export variables
+        id: export_vars
+        run: |
+          echo "need_build=$need_build" >> "$GITHUB_OUTPUT"
+          echo "sogo_release_tag=$sogo_release_tag" >> "$GITHUB_OUTPUT"
+          echo "release_version=$sogo_release_version" >> "$GITHUB_OUTPUT"
+    outputs:
+      need_build: ${{ steps.export_vars.outputs.need_build }}
+      release_version: ${{ steps.export_vars.outputs.release_version }}
+
+  create_deb_pkgs:
+    name: "⚙️ Create .deb packages"
+    needs: check_build_need
+    runs-on: ubuntu-20.04
+    env:
+      DEBIAN_FRONTEND: "noninteractive"
+      APT_GET_COMMON_FLAGS: "--no-install-recommends --no-install-suggests --quiet=2 --assume-yes --allow-change-held-packages --allow-downgrades -o=Dpkg::Use-Pty=0"
+      RELEASE_VER: ${{ needs.check_build_need.outputs.release_version }}
+    if: ${{ needs.check_build_need.outputs.need_build == 'TRUE' }}
+    steps:
+      - name: ⏫ Update APT repos
+        run: |
+          sudo apt-get update $APT_GET_COMMON_FLAGS
+      - name: 🧹 Remove firefox as it takes long to update
+        run: |
+          sudo apt-get remove $APT_GET_COMMON_FLAGS \
+            firefox
+      - name: ⏫ Upgrade software
+        run: |
+          sudo apt-get upgrade $APT_GET_COMMON_FLAGS
+      - name: 🛠️ Install build packages
+        run: |
+          sudo apt-get install $APT_GET_COMMON_FLAGS \
+            git zip wget make debhelper gnustep-make libssl-dev libgnustep-base-dev libldap2-dev libytnef0-dev zlib1g-dev libpq-dev \
+            libmariadbclient-dev-compat libmemcached-dev liblasso3-dev libcurl4-gnutls-dev devscripts libexpat1-dev libpopt-dev libsbjson-dev \
+            libsbjson2.3 libcurl4 liboath-dev libsodium-dev libzip-dev libwbxml2-dev python3 python-is-python3 git build-essential tar
+      - name: 🛠️ Install dependencies
+        run: |
+          sudo apt-get install $APT_GET_COMMON_FLAGS --fix-broken
+      - name: ⬇️ Check out SOPE release ${{ needs.check_build_need.outputs.release_version }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOPE_REPO_NAME }}
+          ref: "SOPE-${{ needs.check_build_need.outputs.release_version }}"
+          lfs: true
+          submodules: true
+          path: SOPE
+      - name: ⬇️ Check out SOGo release ${{ needs.check_build_need.outputs.release_version }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOGO_REPO_NAME }}
+          ref: "SOGo-${{ needs.check_build_need.outputs.release_version }}"
+          lfs: true
+          submodules: true
+          path: SOGo
+      - name: 💾 Pack sources
+        run: |
+          tar --gzip --create --recursion --file=build-sources.tar.gz SOPE SOGo
+      - name: 📦 Prepare debian packaging for SOPE
+        working-directory: ./SOPE
+        run: |
+          cp --no-dereference --preserve=links --recursive ./packaging/debian ./debian
+      - name: 🏷️ Run debchange for SOPE
+        working-directory: ./SOPE
+        run: |
+          debchange --newversion "$RELEASE_VER" "Automated build for $RELEASE_VER"
+      - name: 🔨 Import rules for SOPE
+        working-directory: ./SOPE
+        run: |
+          ./debian/rules
+      - name: ⚒️ Build SOPE
+        working-directory: ./SOPE
+        run: |
+          dpkg-buildpackage --build=binary
+      - name: 🛠️ Install built SOPE packages
+        run: |
+          sudo dpkg --install libsope*.deb
+      - name: 📦 Prepare debian packaging for SOGo
+        working-directory: ./SOGo
+        run: |
+          cp --no-dereference --preserve=links --recursive ./packaging/debian ./debian
+      - name: 🏷️ Run debchange for SOGo
+        working-directory: ./SOGo
+        run: |
+          debchange --newversion "$RELEASE_VER" "Automated build for $RELEASE_VER"
+      - name: 🔨 Import rules for SOGo
+        working-directory: ./SOGo
+        run: |
+          ./debian/rules
+      - name: ⚒️ Build SOGo
+        working-directory: ./SOGo
+        run: |
+          dpkg-buildpackage --build=binary
+      - name: 🔀 Separate normal, developement and debug .deb packages by directories
+        run: |
+          mkdir --parent ./SOGo-deb-dev_and_dbg-${RELEASE_VER}
+          mv --force --target-directory=./SOGo-deb-dev_and_dbg-${RELEASE_VER} --verbose ./*-dev_*.deb 
+          mv --force --target-directory=./SOGo-deb-dev_and_dbg-${RELEASE_VER} --verbose ./*-dbg_*.deb
+          mkdir --parent ./SOGo-deb-${RELEASE_VER}
+          mv --force --target-directory=./SOGo-deb-${RELEASE_VER} --verbose ./*.deb
+      - name: 💾 Pack developement and debug .deb packages to archive
+        run: |
+          cd ./SOGo-deb-dev_and_dbg-${RELEASE_VER}
+          tar --verbose --gzip --create --recursion --file=SOGo-deb-dev_and_dbg-${RELEASE_VER}.tar.gz *
+          cd ..
+          mv --force --target-directory=. --verbose ./SOGo-deb-dev_and_dbg-${RELEASE_VER}/*.tar.gz
+      - name: 💾 Pack normal .deb packages to archive
+        run: |
+          cd ./SOGo-deb-${RELEASE_VER}
+          tar --verbose --gzip --create --recursion --file=SOGo-deb-${RELEASE_VER}.tar.gz *
+          cd ..
+          mv --force --target-directory=. --verbose ./SOGo-deb-${RELEASE_VER}/*.tar.gz
+      - name: 🚀 Create release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: softprops/action-gh-release@v1
+        with:
+          name: "SOGo-${{ env.RELEASE_VER }} .deb"
+          tag_name: "SOGO-${{ env.RELEASE_VER }}"
+          draft: false
+          prerelease: false
+          files: |
+            ./*.tar.gz
+          body: |
+            SOGo-${{ env.RELEASE_VER }} .deb packages
+
+            This is automated build and provided AS-IS.
+
+            * `SOGo-deb-${{env.RELEASE_VER}}.tar.gz`: normal packages
+            * `SOGo-deb-dev_and_dbg-${{env.RELEASE_VER}}.tar.gz`: developement and debug packages
+            * `build-sources.tar.gz`: git clones of SOPE and SOGo repos used for build
+            * `Source code`: contains github action that was used to build packages
+
+            Source repositories used:
+              * [${{ vars.SOGO_REPO }}, tag SOGo-${{env.RELEASE_VER}}](https://github.com/Alinto/sogo/releases/tag/SOGo-${{env.RELEASE_VER}})
+              * [${{ vars.SOPE_REPO }}, tag SOPE-${{env.RELEASE_VER}}](https://github.com/Alinto/sope/releases/tag/SOPE-${{env.RELEASE_VER}})
+
+          fail_on_unmatched_files: true
+          generate_release_notes: false
